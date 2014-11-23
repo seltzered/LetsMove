@@ -53,6 +53,10 @@ static BOOL AuthorizedInstall(NSString *srcPath, NSString *dstPath, BOOL *cancel
 static BOOL CopyBundle(NSString *srcPath, NSString *dstPath);
 static NSString *ShellQuotedString(NSString *string);
 static void Relaunch(NSString *destinationPath);
+static bool runProcessAsAdministrator( NSString* scriptPath,
+                                      NSArray *arguments,
+                                      NSString ** output,
+                                      NSString ** errorDescription );
 
 // Main worker function
 void PFMoveToApplicationsFolderIfNecessary(void) {
@@ -380,7 +384,6 @@ static BOOL AuthorizedInstall(NSString *srcPath, NSString *dstPath, BOOL *cancel
 	if ([[dstPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] length] == 0) return NO;
 	if ([[srcPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] length] == 0) return NO;
 
-	int pid, status;
 	AuthorizationRef myAuthorizationRef;
 
 	// Get the authorization
@@ -398,42 +401,48 @@ static BOOL AuthorizedInstall(NSString *srcPath, NSString *dstPath, BOOL *cancel
 		goto fail;
 	}
 
-	static OSStatus (*security_AuthorizationExecuteWithPrivileges)(AuthorizationRef authorization, const char *pathToTool,
-																   AuthorizationFlags options, char * const *arguments,
-																   FILE **communicationsPipe) = NULL;
-	if (!security_AuthorizationExecuteWithPrivileges) {
-		// On 10.7, AuthorizationExecuteWithPrivileges is deprecated. We want to still use it since there's no
-		// good alternative (without requiring code signing). We'll look up the function through dyld and fail
-		// if it is no longer accessible. If Apple removes the function entirely this will fail gracefully. If
-		// they keep the function and throw some sort of exception, this won't fail gracefully, but that's a
-		// risk we'll have to take for now.
-		security_AuthorizationExecuteWithPrivileges = dlsym(RTLD_DEFAULT, "AuthorizationExecuteWithPrivileges");
-	}
-	if (!security_AuthorizationExecuteWithPrivileges) {
-		goto fail;
-	}
-
 	// Delete the destination
 	{
-		char *args[] = {"-rf", (char *)[dstPath fileSystemRepresentation], NULL};
-		err = security_AuthorizationExecuteWithPrivileges(myAuthorizationRef, "/bin/rm", kAuthorizationFlagDefaults, args, NULL);
-		if (err != errAuthorizationSuccess) goto fail;
-
-		// Wait until it's done
-		pid = wait(&status);
-		if (pid == -1 || !WIFEXITED(status)) goto fail; // We don't care about exit status as the destination most likely does not exist
-	}
+        NSString * output;
+        NSString * errorDescription;
+        char *dstPathFileSystemRepresentation = (char *) malloc(sizeof(char) * 1024);
+        
+        if(![dstPath getFileSystemRepresentation:dstPathFileSystemRepresentation maxLength:1024]) goto fail;
+        
+        NSArray *args = [NSArray arrayWithObjects:@"-rf",
+                         [NSString stringWithUTF8String:dstPathFileSystemRepresentation] ,
+                         nil];
+        bool procStatus =  runProcessAsAdministrator( @"/bin/rm",
+                                                     args,
+                                                     &output,
+                                                     &errorDescription );
+        
+        free(dstPathFileSystemRepresentation);
+        
+        if (!procStatus) goto fail;
+    }
 
 	// Copy
 	{
-		char *args[] = {"-pR", (char *)[srcPath fileSystemRepresentation], (char *)[dstPath fileSystemRepresentation], NULL};
-		err = security_AuthorizationExecuteWithPrivileges(myAuthorizationRef, "/bin/cp", kAuthorizationFlagDefaults, args, NULL);
-		if (err != errAuthorizationSuccess) goto fail;
-
-		// Wait until it's done
-		pid = wait(&status);
-		if (pid == -1 || !WIFEXITED(status) || WEXITSTATUS(status)) goto fail;
-	}
+        NSString * output;
+        NSString * errorDescription;
+        char *srcPathFileSystemRepresentation = (char *) malloc(sizeof(char) * 1024);
+        
+        if(![srcPath getFileSystemRepresentation:srcPathFileSystemRepresentation maxLength:1024]) goto fail;
+        
+        NSArray *args = [NSArray arrayWithObjects:@"-pR",
+                         [NSString stringWithUTF8String:srcPathFileSystemRepresentation] ,
+                         nil];
+        
+        bool procStatus =  runProcessAsAdministrator( @"/bin/cp",
+                                                     args,
+                                                     &output,
+                                                     &errorDescription );
+        
+        free(srcPathFileSystemRepresentation);
+        
+        if (!procStatus) goto fail;
+    }
 
 	AuthorizationFree(myAuthorizationRef, kAuthorizationFlagDefaults);
 	return YES;
@@ -484,4 +493,49 @@ static void Relaunch(NSString *destinationPath) {
 	NSString *script = [NSString stringWithFormat:@"(while /bin/kill -0 %d >&/dev/null; do /bin/sleep 0.1; done; %@; /usr/bin/open %@) &", pid, preOpenCmd, quotedDestinationPath];
 
 	[NSTask launchedTaskWithLaunchPath:@"/bin/sh" arguments:[NSArray arrayWithObjects:@"-c", script, nil]];
+}
+
+static bool runProcessAsAdministrator( NSString* scriptPath,
+                                      NSArray *arguments,
+                                      NSString ** output,
+                                      NSString ** errorDescription )
+{
+    
+    NSString * allArgs = [arguments componentsJoinedByString:@" "];
+    NSString * fullScript = [NSString stringWithFormat:@"'%@' %@", scriptPath, allArgs];
+    
+    NSDictionary *errorInfo = [NSDictionary new];
+    NSString *script =  [NSString stringWithFormat:@"do shell script \"%@\" with administrator privileges", fullScript];
+    
+    NSAppleScript *appleScript = [[NSAppleScript new] initWithSource:script];
+    NSAppleEventDescriptor * eventResult = [appleScript executeAndReturnError:&errorInfo];
+    
+    // Check errorInfo
+    if (! eventResult)
+    {
+        // Describe common errors
+        *errorDescription = nil;
+        if ([errorInfo valueForKey:NSAppleScriptErrorNumber])
+        {
+            NSNumber * errorNumber = (NSNumber *)[errorInfo valueForKey:NSAppleScriptErrorNumber];
+            if ([errorNumber intValue] == -128)
+                *errorDescription = @"The administrator password is required to do this.";
+        }
+        
+        // Set error message from provided message
+        if (*errorDescription == nil)
+        {
+            if ([errorInfo valueForKey:NSAppleScriptErrorMessage])
+                *errorDescription =  (NSString *)[errorInfo valueForKey:NSAppleScriptErrorMessage];
+        }
+        
+        return NO;
+    }
+    else
+    {
+        // Set output to the AppleScript's output
+        *output = [eventResult stringValue];
+        
+        return YES;
+    }
 }
